@@ -1,0 +1,126 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  packages: write
+  contents: write
+
+jobs:
+  build:
+    name: Build for Linux and MacOS (ARM)
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          go get yamldiff
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o dist/yamldiff-${{ matrix.goos }}-${{ matrix.goarch }}
+      
+      - name: Archive binary
+        run: |
+          zip -j dist/myapp-${{ matrix.goos }}-${{ matrix.goarch }}.zip dist/yamldiff-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Upload Release Asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: yamldiff-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/yamldiff-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bin
+
+      - name: Get latest version tag
+        id: tag
+        run: echo ::set-output name=tag::$(git describe --tags --abbrev=0)
+      
+      - name: Set up Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Bump version and tag
+        id: version
+        run: |
+          git fetch --tags
+          
+          # Check if there are any tags
+          latest_tag=$(git describe --tags $(git rev-list --tags --max-count=1) 2>/dev/null || echo "")
+          
+          # If no tags exist, start with v0.1.0
+          if [ -z "$latest_tag" ]; then
+            version="v0.1.0"
+          else
+            # Increment the version number
+            version=$(echo $latest_tag | awk -F. '{$NF = $NF + 1;} 1' | sed 's/ /./g')
+          fi
+
+          echo "New version: $version"
+          
+          # Tag the repository with the new version
+          git tag $version
+          git push origin $version
+
+          echo ::set-output name=version::${version}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - name: Changelog
+        uses: scottbrenner/generate-changelog-action@master
+        id: Changelog
+        env:
+          REPO: ${{ github.repository }}
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          release_name: Release  ${{ steps.version.outputs.version }}
+          body: |
+            ${{ steps.Changelog.outputs.changelog }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets
+        run: |
+          ls bin/
+          for file in bin/*; do
+            curl -s --data-binary @"$file" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/zip" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ steps.create_release.outputs.id }}/assets?name=$(basename $file)"
+          done
+
+
